@@ -212,20 +212,27 @@ jobs:
           .venv/bin/pip install --upgrade --quiet pip
           .venv/bin/pip install --require-hashes --quiet -r requirements.txt
       - name: Generate SPDX SBOM of the installed environment
+        # `rootfs`, not `fs`: a filesystem scan only reads lock files, and
+        # the venv has none, so it produced a one-package SBOM on the first
+        # run of this job. `rootfs` reads the installed dist-info metadata.
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          scan-type: fs
+          scan-type: rootfs
           scan-ref: .venv
           format: spdx-json
           output: sbom.spdx.json
-      - name: Name the document and show what it holds
-        # Trivy names a filesystem SBOM after the path it scanned; the SBOM
-        # service keys documents by name, so give it the project's.
+      - name: Name the document and check it is not empty
+        # Trivy names the SBOM after the path it scanned; the SBOM service
+        # keys documents by name, so give it the project's. The lockfile
+        # resolves to ~37 distributions; far fewer means the scan read
+        # nothing and must not be published as if it had.
         run: |
           jq --arg name "proton-bridge-mcp:ci" '.name = $name' sbom.spdx.json > sbom.named.json
           mv sbom.named.json sbom.spdx.json
-          echo "packages: $(jq '.packages | length' sbom.spdx.json)"
-          jq -r '.packages[] | select(.externalRefs != null) | .name + "@" + .versionInfo' sbom.spdx.json | sort | head -40
+          n=$(jq '[.packages[] | select(.externalRefs != null)] | length' sbom.spdx.json)
+          echo "packages with purls: $n"
+          jq -r '.packages[] | select(.externalRefs != null) | .name + "@" + .versionInfo' sbom.spdx.json | sort
+          test "$n" -ge 20 || { echo "::error::SBOM has only $n packages; the venv was not read"; exit 1; }
       - name: Upload SBOM artifact
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
