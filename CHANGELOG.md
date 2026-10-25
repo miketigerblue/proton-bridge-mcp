@@ -6,7 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ## [Unreleased]
 
+### Security
+- Re-locked both hash-pinned lockfiles (`uv pip compile --upgrade`). The
+  31 August lock had accumulated 55 known advisories across 9 packages,
+  among them anyio 4.13.0, certifi 2026.4.22, cryptography 48.0.0 and
+  idna 3.13; `pip-audit --strict` is clean on both files again. `mcp` is
+  bounded to `<2` in `requirements.in` and `pyproject.toml`: 2.x renames
+  `FastMCP` to `MCPServer` and the server targets the 1.x API (now 1.30.0).
+
 ### Added
+- `sbom` CI job: installs the runtime lockfile into a clean venv and
+  publishes a Trivy SPDX SBOM (`proton-bridge-mcp:ci`) to the Tiger Blue
+  SBOM service on `main` pushes; PR runs keep it as an artifact.
 - `bandit` (Python SAST) and `pip-audit` (PyPA Advisory Database vulnerability scan) jobs in CI. `bandit` runs against the two source files (`proton_bridge_mcp.py`, `bootstrap.py`) with project-level configuration in `pyproject.toml [tool.bandit]`; the skip list is explicit and each entry is justified with a comment (B101 asserts, B110 cleanup-path try/except/pass, B404 subprocess import, B603 hardcoded-args subprocess, B606 hardcoded-args execv, B613 trojan-source — the last because the `_INVISIBLE_CHARS` regex literal *is* the trojan-source mitigation and necessarily contains the controls it strips). `pip-audit` audits both `requirements.txt` and `requirements-dev.txt` with `--strict` so unresolvable advisories fail the build rather than silently passing. Both tools are intentionally unpinned in the workflow — they're security tools whose value depends on staying current with new check categories. Tests are excluded from the bandit scan (assert and hardcoded test data are non-issues there).
 
 ### Documentation
