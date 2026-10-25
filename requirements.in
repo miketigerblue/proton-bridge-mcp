@@ -1,2 +1,3 @@
-mcp[cli]
+# mcp 2.x renamed FastMCP to MCPServer and changed APIs; the server targets 1.x.
+mcp[cli]<2
 pydantic
