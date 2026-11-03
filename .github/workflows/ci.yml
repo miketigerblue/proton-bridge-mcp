@@ -211,12 +211,33 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --upgrade --quiet pip
           .venv/bin/pip install --require-hashes --quiet -r requirements.txt
+      - name: Install Trivy 0.76.1
+        # trivy-action installs Trivy through setup-trivy, whose install
+        # script downloads the binary via get.trivy.dev. That host stopped
+        # resolving on 2026-11-03 (aquasecurity/setup-trivy#42), which failed
+        # every scan step here before it ran. Fetch the release asset from
+        # GitHub directly, check it against the digest pinned below, and have
+        # trivy-action use it (skip-setup-trivy on each step).
+        env:
+          TRIVY_VERSION: "0.76.1"
+          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 --retry-delay 5 -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/trivy.tar.gz -C "$HOME/.local/bin" trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/trivy" --version
+
       - name: Generate SPDX SBOM of the installed environment
         # `rootfs`, not `fs`: a filesystem scan only reads lock files, and
         # the venv has none, so it produced a one-package SBOM on the first
         # run of this job. `rootfs` reads the installed dist-info metadata.
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
+          skip-setup-trivy: true
           scan-type: rootfs
           scan-ref: .venv
           format: spdx-json
