@@ -34,6 +34,11 @@ Environment variables
                                 | "best_effort" (explicit downgrade; allows CERT_NONE on loopback)
     PROTON_BRIDGE_DEFAULT_FROM  optional default From address
     PROTON_BRIDGE_KEYCHAIN_SVC  default "proton_bridge_mcp"
+    PROTON_BRIDGE_ATTACHMENT_DIRS
+                                folders attachments may come from, separated by
+                                ":" (unset: every attachment is refused)
+    PROTON_BRIDGE_MAX_ATTACHMENT_MB
+                                default 18; combined size limit per message
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ import email
 import imaplib
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -98,6 +104,18 @@ KEYCHAIN_SERVICE = os.environ.get("PROTON_BRIDGE_KEYCHAIN_SVC", "proton_bridge_m
 
 MAX_BODY_CHARS = 250_000
 HOME = Path.home()
+
+# Local files that proton_send_email / proton_create_draft may attach. The
+# allow-list keeps a prompt-injection payload from mailing out arbitrary local
+# files (keys, keychains, configs), so it starts empty: attachments stay off
+# until PROTON_BRIDGE_ATTACHMENT_DIRS names the allowed folders (absolute paths
+# separated by os.pathsep, i.e. ":" on macOS).
+ATTACHMENT_DIRS = [
+    Path(p.strip()).expanduser()
+    for p in os.environ.get("PROTON_BRIDGE_ATTACHMENT_DIRS", "").split(os.pathsep)
+    if p.strip()
+]
+MAX_ATTACHMENT_BYTES = int(os.environ.get("PROTON_BRIDGE_MAX_ATTACHMENT_MB", "18")) * 1024 * 1024
 
 BRIDGE_CERT_CANDIDATES = [
     HOME / "Library/Application Support/protonmail/bridge-v3/cert.pem",
@@ -719,6 +737,17 @@ class SendEmailInput(_Base):
     from_addr: Optional[str] = Field(default=None)
     reply_to_message_id: Optional[str] = Field(default=None)
     save_to_sent: bool = Field(default=True)
+    attachments: Optional[List[str]] = Field(
+        default=None,
+        max_length=10,
+        description=(
+            "Absolute paths of local files to attach (max 10). Only files "
+            "inside the folders listed in PROTON_BRIDGE_ATTACHMENT_DIRS are "
+            "accepted, together at most PROTON_BRIDGE_MAX_ATTACHMENT_MB "
+            "(default 18 MB). Every attachment is refused while that setting "
+            "is empty."
+        ),
+    )
     acknowledged: bool = Field(
         ...,
         description=(
@@ -740,6 +769,17 @@ class CreateDraftInput(_Base):
     cc: Optional[List[str]] = Field(default=None)
     bcc: Optional[List[str]] = Field(default=None)
     from_addr: Optional[str] = Field(default=None)
+    attachments: Optional[List[str]] = Field(
+        default=None,
+        max_length=10,
+        description=(
+            "Absolute paths of local files to attach (max 10). Only files "
+            "inside the folders listed in PROTON_BRIDGE_ATTACHMENT_DIRS are "
+            "accepted, together at most PROTON_BRIDGE_MAX_ATTACHMENT_MB "
+            "(default 18 MB). Every attachment is refused while that setting "
+            "is empty."
+        ),
+    )
     acknowledged: bool = Field(
         ...,
         description=(
@@ -789,10 +829,62 @@ class DeleteInput(_Base):
 # --------------------------------------------------------------------------- #
 # Message building
 # --------------------------------------------------------------------------- #
+Attachment = Tuple[str, bytes, str, str]  # (filename, data, maintype, subtype)
+
+
+def _load_attachments(paths: Optional[List[str]]) -> List[Attachment]:
+    """Read local files to attach, enforcing the folder allow-list and size cap.
+
+    Raises ValueError with a readable message when no folder is configured, a
+    path is relative, outside ATTACHMENT_DIRS (checked first, after resolving
+    symlinks), missing, not a regular file, or when all files together exceed
+    MAX_ATTACHMENT_BYTES.
+    """
+    if not paths:
+        return []
+    if not ATTACHMENT_DIRS:
+        raise ValueError(
+            "attachments are disabled: set PROTON_BRIDGE_ATTACHMENT_DIRS to the "
+            "folders they may come from"
+        )
+    roots = [root.resolve() for root in ATTACHMENT_DIRS]
+    out: List[Attachment] = []
+    total = 0
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"attachment path must be absolute: {raw}")
+        # Check the allow-list before touching the file, so the error cannot
+        # reveal which paths exist outside the allowed folders.
+        try:
+            real = path.resolve()
+        except (OSError, RuntimeError):  # symlink loop, before Python 3.13
+            real = None
+        if real is None or not any(real.is_relative_to(root) for root in roots):
+            allowed = ", ".join(str(root) for root in roots)
+            raise ValueError(f"attachment outside the allowed folders ({allowed}): {raw}")
+        if not real.exists():
+            raise ValueError(f"attachment not found: {raw}")
+        if not real.is_file():
+            raise ValueError(f"attachment is not a regular file: {raw}")
+        total += real.stat().st_size
+        if total > MAX_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"attachments exceed {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB in total"
+            )
+        ctype, encoding = mimetypes.guess_type(real.name)
+        if ctype is None or encoding is not None:
+            ctype = "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        out.append((path.name, real.read_bytes(), maintype, subtype))
+    return out
+
+
 def _build_email(*, sender: str, to: List[str], subject: str,
                  body_text: str, body_html: Optional[str],
                  cc: Optional[List[str]], bcc: Optional[List[str]],
-                 reply_to_message_id: Optional[str]) -> EmailMessage:
+                 reply_to_message_id: Optional[str],
+                 attachments: Optional[List[Attachment]] = None) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(to)
@@ -809,6 +901,8 @@ def _build_email(*, sender: str, to: List[str], subject: str,
     msg.set_content(body_text or "")
     if body_html:
         msg.add_alternative(body_html, subtype="html")
+    for filename, data, maintype, subtype in attachments or []:
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
     return msg
 
 
@@ -1250,18 +1344,24 @@ async def proton_delete_email(params: DeleteInput, ctx: Context) -> str:
                  "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
 )
 async def proton_send_email(params: SendEmailInput, ctx: Context) -> str:
-    """Send via the Bridge SMTP relay, optionally APPEND-ing a copy to Sent."""
+    """Send via the Bridge SMTP relay, optionally APPEND-ing a copy to Sent.
+
+    `attachments` takes absolute paths of local files inside the folders listed
+    in PROTON_BRIDGE_ATTACHMENT_DIRS. Every attachment is refused without it.
+    """
     if not params.acknowledged:
         await ctx.warning(f"refused proton_send_email to={params.to}: acknowledged=false")
         return _refused_unack("proton_send_email")
     try:
         pw = _resolve_password()
         sender = _sender(params.from_addr)
+        atts = _load_attachments(params.attachments)
         msg = _build_email(
             sender=sender, to=params.to, subject=params.subject,
             body_text=params.body_text, body_html=params.body_html,
             cc=params.cc, bcc=params.bcc,
             reply_to_message_id=params.reply_to_message_id,
+            attachments=atts,
         )
         rcpts = _all_rcpts(params.to, params.cc, params.bcc)
 
@@ -1275,7 +1375,7 @@ async def proton_send_email(params: SendEmailInput, ctx: Context) -> str:
 
         async with _smtp_lock:
             await asyncio.to_thread(_smtp_send)
-        await ctx.info(f"sent message-id={msg['Message-ID']} to={params.to}")
+        await ctx.info(f"sent message-id={msg['Message-ID']} to={params.to} attachments={len(atts)}")
 
         appended_to = None
         append_note = ""
@@ -1299,6 +1399,7 @@ async def proton_send_email(params: SendEmailInput, ctx: Context) -> str:
             "from": sender, "to": params.to, "cc": params.cc or [],
             "bcc_count": len(params.bcc or []),
             "subject": params.subject,
+            "attachments": [{"filename": a[0], "size_bytes": len(a[1])} for a in atts],
             "saved_to_sent": bool(appended_to),
             "note": append_note,
         }, indent=2)
@@ -1312,7 +1413,11 @@ async def proton_send_email(params: SendEmailInput, ctx: Context) -> str:
                  "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
 )
 async def proton_create_draft(params: CreateDraftInput, ctx: Context) -> str:
-    """APPEND a draft into the Drafts mailbox for review inside Proton."""
+    """APPEND a draft into the Drafts mailbox for review inside Proton.
+
+    `attachments` takes absolute paths of local files inside the folders listed
+    in PROTON_BRIDGE_ATTACHMENT_DIRS. Every attachment is refused without it.
+    """
     # Drafts addressed to any non-self recipient are an exfil staging
     # channel: harvested mail composed into a draft to attacker@evil.com
     # sits in Drafts until a future click sends it. Refuse external-
@@ -1328,10 +1433,12 @@ async def proton_create_draft(params: CreateDraftInput, ctx: Context) -> str:
         return _refused_unack("proton_create_draft")
     try:
         sender = _sender(params.from_addr)
+        atts = _load_attachments(params.attachments)
         msg = _build_email(
             sender=sender, to=params.to, subject=params.subject,
             body_text=params.body_text, body_html=params.body_html,
             cc=params.cc, bcc=params.bcc, reply_to_message_id=None,
+            attachments=atts,
         )
 
         def _op(client: imaplib.IMAP4):
@@ -1357,6 +1464,7 @@ async def proton_create_draft(params: CreateDraftInput, ctx: Context) -> str:
             "status": "draft_saved",
             "mailbox": drafts, "uid": uid,
             "subject": params.subject, "to": params.to,
+            "attachments": [{"filename": a[0], "size_bytes": len(a[1])} for a in atts],
             "message_id": msg["Message-ID"],
         }, indent=2)
     except Exception as e:

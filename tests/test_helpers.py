@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import email
 import json
+import os
 import re
+import subprocess
+import sys
 from email.message import EmailMessage
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -688,3 +692,184 @@ class TestLocateBridgeCert:
         nope = tmp_path / "does-not-exist.pem"
         monkeypatch.setattr(pbm, "BRIDGE_CERT_PATH", str(nope))
         assert pbm._locate_bridge_cert() is None
+
+
+# ----------------------------------------------------------------------------
+# Attachments: folder allow-list, size cap, MIME building
+# ----------------------------------------------------------------------------
+class TestLoadAttachments:
+    @pytest.fixture
+    def root(self, tmp_path, monkeypatch):
+        root = tmp_path / "allowed"
+        root.mkdir()
+        monkeypatch.setattr(pbm, "ATTACHMENT_DIRS", [root])
+        monkeypatch.setattr(pbm, "MAX_ATTACHMENT_BYTES", 1024)
+        return root
+
+    def test_none_and_empty_return_empty_list(self, root):
+        assert pbm._load_attachments(None) == []
+        assert pbm._load_attachments([]) == []
+
+    def test_pdf_inside_allowed_folder_is_loaded(self, root):
+        f = root / "sub" / "Entwurf.pdf"
+        f.parent.mkdir()
+        f.write_bytes(b"%PDF-1.7 test")
+        [att] = pbm._load_attachments([str(f)])
+        assert att == ("Entwurf.pdf", b"%PDF-1.7 test", "application", "pdf")
+
+    def test_unknown_extension_falls_back_to_octet_stream(self, root):
+        f = root / "data.unknownext"
+        f.write_bytes(b"x")
+        [(_, _, maintype, subtype)] = pbm._load_attachments([str(f)])
+        assert (maintype, subtype) == ("application", "octet-stream")
+
+    def test_relative_path_is_rejected(self, root):
+        with pytest.raises(ValueError, match="absolute"):
+            pbm._load_attachments(["Entwurf.pdf"])
+
+    def test_missing_file_is_rejected(self, root):
+        with pytest.raises(ValueError, match="not found"):
+            pbm._load_attachments([str(root / "missing.pdf")])
+
+    def test_directory_is_rejected(self, root):
+        with pytest.raises(ValueError, match="regular file"):
+            pbm._load_attachments([str(root)])
+
+    def test_file_outside_allowed_folder_is_rejected(self, root, tmp_path):
+        f = tmp_path / "secret.txt"
+        f.write_text("key")
+        with pytest.raises(ValueError, match="outside the allowed folders"):
+            pbm._load_attachments([str(f)])
+
+    def test_dotdot_escape_is_rejected(self, root, tmp_path):
+        (tmp_path / "secret.txt").write_text("key")
+        with pytest.raises(ValueError, match="outside the allowed folders"):
+            pbm._load_attachments([str(root / ".." / "secret.txt")])
+
+    def test_symlink_escaping_allowed_folder_is_rejected(self, root, tmp_path):
+        target = tmp_path / "secret.txt"
+        target.write_text("key")
+        link = root / "harmless.pdf"
+        link.symlink_to(target)
+        with pytest.raises(ValueError, match="outside the allowed folders"):
+            pbm._load_attachments([str(link)])
+
+    def test_errors_do_not_reveal_what_exists_outside_allowed_folder(self, root, tmp_path):
+        existing = tmp_path / "secret.txt"
+        existing.write_text("key")
+        # A file, a missing path and a directory must all get the same answer.
+        for path in (existing, tmp_path / "missing.txt", tmp_path):
+            with pytest.raises(ValueError, match="outside the allowed folders"):
+                pbm._load_attachments([str(path)])
+
+    def test_symlink_loop_is_rejected(self, root):
+        loop = root / "loop.pdf"
+        loop.symlink_to(loop)
+        with pytest.raises(ValueError):
+            pbm._load_attachments([str(loop)])
+
+    def test_total_size_cap(self, root):
+        a = root / "a.bin"
+        b = root / "b.bin"
+        a.write_bytes(b"x" * 600)
+        b.write_bytes(b"x" * 600)
+        assert len(pbm._load_attachments([str(a)])) == 1
+        with pytest.raises(ValueError, match="exceed"):
+            pbm._load_attachments([str(a), str(b)])
+
+    def test_no_configured_folder_refuses_every_path(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pbm, "ATTACHMENT_DIRS", [])
+        existing = tmp_path / "a.pdf"
+        existing.write_bytes(b"x")
+        # A missing file gets the same answer, so the error does not reveal
+        # which local paths exist.
+        for path in (existing, tmp_path / "missing.pdf"):
+            with pytest.raises(ValueError, match="PROTON_BRIDGE_ATTACHMENT_DIRS"):
+                pbm._load_attachments([str(path)])
+
+    def test_no_configured_folder_keeps_mail_without_attachments_working(self, monkeypatch):
+        monkeypatch.setattr(pbm, "ATTACHMENT_DIRS", [])
+        assert pbm._load_attachments(None) == []
+        assert pbm._load_attachments([]) == []
+
+
+class TestAttachmentDirsEnv:
+    """ATTACHMENT_DIRS is read at import, so each case needs a fresh interpreter."""
+
+    @staticmethod
+    def _dirs(value=None):
+        env = {k: v for k, v in os.environ.items() if k != "PROTON_BRIDGE_ATTACHMENT_DIRS"}
+        if value is not None:
+            env["PROTON_BRIDGE_ATTACHMENT_DIRS"] = value
+        code = (
+            "import json, proton_bridge_mcp as p; "
+            "print(json.dumps([str(d) for d in p.ATTACHMENT_DIRS]))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            env=env, cwd=Path(pbm.__file__).parent, check=True,
+        )
+        return json.loads(result.stdout)
+
+    def test_unset_means_no_allowed_folder(self):
+        assert self._dirs() == []
+
+    def test_folders_are_split_on_pathsep_and_trimmed(self):
+        assert self._dirs(f"/a{os.pathsep} /b {os.pathsep}") == ["/a", "/b"]
+
+
+class TestBuildEmailWithAttachments:
+    @staticmethod
+    def _build(attachments):
+        return pbm._build_email(
+            sender="me@proton.me", to=["you@example.com"], subject="Angebot",
+            body_text="Hallo", body_html=None, cc=None, bcc=None,
+            reply_to_message_id=None, attachments=attachments,
+        )
+
+    @staticmethod
+    def _parse(msg):
+        from email import policy
+        return email.message_from_bytes(msg.as_bytes(), _class=EmailMessage, policy=policy.default)
+
+    def test_without_attachments_stays_single_part(self):
+        msg = self._build(None)
+        assert not msg.is_multipart()
+        assert msg.get_content().strip() == "Hallo"
+
+    def test_attachment_round_trips(self):
+        msg = self._build([("draft.pdf", b"%PDF-1.7 data", "application", "pdf")])
+        parsed = self._parse(msg)
+        assert parsed.get_content_type() == "multipart/mixed"
+        assert parsed.get_body(preferencelist=("plain",)).get_content().strip() == "Hallo"
+        [att] = list(parsed.iter_attachments())
+        assert att.get_filename() == "draft.pdf"
+        assert att.get_content_type() == "application/pdf"
+        assert att.get_content() == b"%PDF-1.7 data"
+
+    def test_non_ascii_filename_round_trips(self):
+        parsed = self._parse(self._build([("Präsentation.pdf", b"x", "application", "pdf")]))
+        [att] = list(parsed.iter_attachments())
+        assert att.get_filename() == "Präsentation.pdf"
+
+
+class TestAttachmentsInputField:
+    def test_send_accepts_attachments(self):
+        m = pbm.SendEmailInput(to=["a@b.com"], subject="hi", body_text="x",
+                               attachments=["/tmp/a.pdf"], acknowledged=True)
+        assert m.attachments == ["/tmp/a.pdf"]
+
+    def test_draft_accepts_attachments(self):
+        m = pbm.CreateDraftInput(to=["a@b.com"], subject="hi", body_text="x",
+                                 attachments=["/tmp/a.pdf"], acknowledged=True)
+        assert m.attachments == ["/tmp/a.pdf"]
+
+    def test_attachments_default_to_none(self):
+        m = pbm.SendEmailInput(to=["a@b.com"], subject="hi", body_text="x", acknowledged=True)
+        assert m.attachments is None
+
+    def test_more_than_ten_attachments_rejected(self):
+        with pytest.raises(ValidationError):
+            pbm.SendEmailInput(to=["a@b.com"], subject="hi", body_text="x",
+                               attachments=[f"/tmp/{i}.pdf" for i in range(11)],
+                               acknowledged=True)

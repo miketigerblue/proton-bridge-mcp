@@ -34,8 +34,8 @@ Several other Proton MCP servers exist on GitHub. Most are functional and some h
 | `proton_flag_email`          | Mark read/unread, flag/unflag                            | mutate          |
 | `proton_move_email`          | Move a message to another mailbox                        | mutate          |
 | `proton_delete_email`        | Move to Trash (or permanently expunge)                   | destructive (requires `acknowledged=true`) |
-| `proton_send_email`          | Send via Bridge SMTP, optional append-to-Sent            | destructive (requires `acknowledged=true`) |
-| `proton_create_draft`        | Save a draft in Drafts for manual review                 | destructive when addressed externally (requires `acknowledged=true` for non-self recipients) |
+| `proton_send_email`          | Send via Bridge SMTP, optional attachments + Sent copy   | destructive (requires `acknowledged=true`) |
+| `proton_create_draft`        | Save a draft for manual review, optional attachments     | destructive when addressed externally (requires `acknowledged=true` for non-self recipients) |
 
 ## Hardening highlights
 
@@ -45,6 +45,7 @@ Several other Proton MCP servers exist on GitHub. Most are functional and some h
 - **Non-blocking**: blocking stdlib IMAP/SMTP calls run in `asyncio.to_thread` so the event loop stays responsive.
 - **Hash-pinned dependencies** (`requirements.txt`) so the install is reproducible and supply-chain attacks are caught at install time.
 - **Reads never implicitly mark messages read** — `mark_seen=false` is the default on `proton_read_email`.
+- **Attachments are opt-in and allow-listed**: `proton_send_email` and `proton_create_draft` refuse every local file until `PROTON_BRIDGE_ATTACHMENT_DIRS` names the folders they may come from. Symlinks are resolved before the check.
 
 ## Prerequisites
 
@@ -126,6 +127,8 @@ All configuration is done via the `env` block in `claude_desktop_config.json`. S
 | `PROTON_BRIDGE_KEYCHAIN_SVC`      | no       | `proton_bridge_mcp` | Keychain service name. Override only if you have multiple Bridge accounts.       |
 | `PROTON_BRIDGE_PASS`              | no       | —             | Direct password fallback. Avoid; prefer Keychain. Useful for headless / CI.            |
 | `PROTON_BRIDGE_LOG_LEVEL`         | no       | `INFO`        | Standard Python log level.                                                             |
+| `PROTON_BRIDGE_ATTACHMENT_DIRS`   | no       | —             | Folders attachments may come from: absolute paths separated by `:`. Unset: every attachment is refused. Anything inside can be mailed out, so name a dedicated folder without secrets. |
+| `PROTON_BRIDGE_MAX_ATTACHMENT_MB` | no       | `18`          | Combined attachment size per message, before MIME encoding (which adds about a third). |
 
 ## Rotating and revoking
 
