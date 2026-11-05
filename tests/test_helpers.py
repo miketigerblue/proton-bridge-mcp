@@ -266,8 +266,23 @@ class TestBuildSearch:
 
     def test_not_keyword_emits_three_tokens(self):
         out = pbm._build_search(not_keyword="$Junk")
-        assert out[:2] == ["NOT", "KEYWORD"]
-        assert "$Junk" in out[2]
+        assert out == ["NOT", "KEYWORD", "$Junk"]
+
+    def test_keyword_is_sent_as_bare_atom(self):
+        # Proton Bridge rejects a quoted keyword: "Invalid character detected
+        # in atom". RFC 3501 defines the KEYWORD argument as an atom.
+        assert pbm._build_search(keyword="$Label1") == ["KEYWORD", "$Label1"]
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["a b", 'a"b', "a\\b", "a(b", "a)b", "a{b", "a%b", "a*b", "a]b",
+         "a\r\nX1 LOGOUT", "a\x00b", "a\x7fb", "käse"],
+    )
+    def test_keyword_rejects_non_atom_characters(self, bad):
+        with pytest.raises(ValueError):
+            pbm._build_search(keyword=bad)
+        with pytest.raises(ValueError):
+            pbm._build_search(not_keyword=bad)
 
 
 # ----------------------------------------------------------------------------

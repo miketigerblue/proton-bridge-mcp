@@ -631,6 +631,19 @@ def _extract_body(msg: email.message.Message) -> Tuple[str, str, List[Dict[str, 
 # --------------------------------------------------------------------------- #
 # IMAP SEARCH builder
 # --------------------------------------------------------------------------- #
+def _keyword_atom(raw: str) -> str:
+    """Validate an IMAP keyword, which goes on the wire as a bare atom.
+
+    RFC 3501 defines the KEYWORD search argument as an atom, not a string, so
+    quoting it makes Proton Bridge reject the whole command. Without quotes,
+    the value must also be checked here: atom-specials and control characters
+    could otherwise break out of the argument and inject IMAP syntax.
+    """
+    if not re.fullmatch(r'[^\x00-\x20\x7f-\U0010ffff(){%*"\\\]]+', raw):
+        raise ValueError(f"not a valid IMAP keyword: {raw!r}")
+    return raw
+
+
 def _build_search(**kw) -> List[str]:
     criteria: List[str] = []
 
@@ -646,8 +659,8 @@ def _build_search(**kw) -> List[str]:
         ("subject", lambda v: ("SUBJECT", _quote(v))),
         ("body", lambda v: ("BODY", _quote(v))),
         ("text", lambda v: ("TEXT", _quote(v))),
-        ("keyword", lambda v: ("KEYWORD", _quote(v))),
-        ("not_keyword", lambda v: ("NOT", "KEYWORD", _quote(v))),
+        ("keyword", lambda v: ("KEYWORD", _keyword_atom(v))),
+        ("not_keyword", lambda v: ("NOT", "KEYWORD", _keyword_atom(v))),
     ]
     for key, builder in mapping:
         val = kw.get(key)
