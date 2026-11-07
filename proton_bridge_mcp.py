@@ -893,6 +893,18 @@ def _load_attachments(paths: Optional[List[str]]) -> List[Attachment]:
     return out
 
 
+def _message_id(sender: str) -> str:
+    """Build a Message-ID under the sender's domain.
+
+    make_msgid() without a domain calls socket.getfqdn(), which puts the local
+    hostname into every message and can block for as long as a reverse DNS
+    lookup takes (30 seconds observed on macOS).
+    """
+    address = parseaddr(sender)[1]
+    domain = address.rpartition("@")[2] if "@" in address else ""
+    return make_msgid(domain=domain or "localhost.invalid")
+
+
 def _build_email(*, sender: str, to: List[str], subject: str,
                  body_text: str, body_html: Optional[str],
                  cc: Optional[List[str]], bcc: Optional[List[str]],
@@ -907,7 +919,7 @@ def _build_email(*, sender: str, to: List[str], subject: str,
         msg["Bcc"] = ", ".join(bcc)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    msg["Message-ID"] = _message_id(sender)
     if reply_to_message_id:
         msg["In-Reply-To"] = reply_to_message_id
         msg["References"] = reply_to_message_id

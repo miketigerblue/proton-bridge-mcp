@@ -12,6 +12,7 @@ import email
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from email.message import EmailMessage
@@ -866,6 +867,30 @@ class TestBuildEmailWithAttachments:
         parsed = self._parse(self._build([("Präsentation.pdf", b"x", "application", "pdf")]))
         [att] = list(parsed.iter_attachments())
         assert att.get_filename() == "Präsentation.pdf"
+
+
+class TestMessageId:
+    @pytest.fixture(autouse=True)
+    def no_hostname_lookup(self, monkeypatch):
+        def fail(*args):
+            raise AssertionError("socket.getfqdn() must not be called")
+        monkeypatch.setattr(socket, "getfqdn", fail)
+
+    @staticmethod
+    def _message_id(sender):
+        msg = pbm._build_email(
+            sender=sender, to=["you@example.com"], subject="Hi", body_text="Hi",
+            body_html=None, cc=None, bcc=None, reply_to_message_id=None,
+        )
+        return msg["Message-ID"]
+
+    @pytest.mark.parametrize("sender", ["me@proton.me", "Me Myself <me@proton.me>"])
+    def test_uses_the_sender_domain(self, sender):
+        assert self._message_id(sender).endswith("@proton.me>")
+
+    @pytest.mark.parametrize("sender", ["me", "me@"])
+    def test_sender_without_a_domain_still_gets_an_id(self, sender):
+        assert pbm._message_id(sender).endswith("@localhost.invalid>")
 
 
 class TestAttachmentsInputField:
