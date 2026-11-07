@@ -95,6 +95,15 @@ What this server protects against and what it doesn't.
     `PROTON_BRIDGE_USER` and `PROTON_BRIDGE_DEFAULT_FROM` (case-
     insensitive) -- aliases not represented in either env var are
     treated as external for this gate, which is the safe default.
+- **Local-file attachments are opt-in and allow-listed.** `proton_send_email`
+  and `proton_create_draft` refuse every attachment until
+  `PROTON_BRIDGE_ATTACHMENT_DIRS` names at least one folder. Paths must be
+  absolute and are checked after resolving symlinks, so neither `..` nor a
+  symlink leads out of an allowed folder. This check runs before the file is
+  touched, so an error does not reveal which paths exist outside those folders.
+  The combined size is capped by `PROTON_BRIDGE_MAX_ATTACHMENT_MB`. Attachments
+  do not change either tool's `acknowledged` rule, so a self-only draft can copy
+  an allowed file into the operator's own Drafts without it.
 - **Prompt-injection hardening at the read boundary** (partial — see also
   the out-of-scope section below). Two layered mitigations apply to email
   content returned to the LLM:
@@ -160,6 +169,11 @@ What this server protects against and what it doesn't.
   inboxes that may receive injected content; treat the LLM provider as
   having read-access to every email Claude reads via this tool, because
   it does.
+- **Files inside the allowed attachment folders.** The allow-list limits which
+  files can leave the machine, not whether they do. A model that has been
+  convinced to set `acknowledged=true` can mail any file in those folders to
+  any recipient. The mitigation is operator policy; see the hardening
+  recommendations below.
 - **Attacks against Proton's infrastructure or end-to-end-encryption design.**
   Out of this repo's hands.
 - **Non-macOS platforms.** Linux and Windows are unsupported. Bridge runs
@@ -214,6 +228,11 @@ source:
   `TestDeleteInputRequiresAck`, `TestCreateDraftInputRequiresAck`,
   `TestDownloadAttachmentInputRequiresAck`, `TestExternalRecipients`,
   and `TestRefusedUnack` in `tests/test_helpers.py`.
+- `ATTACHMENT_DIRS` is empty unless `PROTON_BRIDGE_ATTACHMENT_DIRS` is set, and
+  `_load_attachments` then refuses every file. When folders are configured, it
+  checks them against the path with symlinks resolved. Both behaviours are
+  pinned by `TestLoadAttachments` and `TestAttachmentDirsEnv` in
+  `tests/test_helpers.py`.
 - No credential, cert path, or message body is logged at `INFO` or `DEBUG`.
 
 If any of these is no longer true, that itself is a security bug — please
@@ -229,5 +248,8 @@ report it via the channel above.
   pinned mode, that means re-running `bootstrap.py` (the cert capture step).
 - Review the MCP client's destructive-action confirmation policy. Never let
   the model auto-execute send/delete/move based on inbound email content.
+- Leave `PROTON_BRIDGE_ATTACHMENT_DIRS` unset unless you need to send local
+  files. If you do, name a dedicated folder without secrets, not your home
+  directory or a whole cloud drive.
 - Rotate the Bridge app-password periodically via Bridge → *Mailbox details*,
   followed by `setup_keychain.sh` (or `bootstrap.py --force-password`).

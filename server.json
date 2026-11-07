@@ -42,6 +42,19 @@
           "description": "Bridge app-password fallback for headless / CI use. Prefer macOS Keychain (set automatically by bootstrap.py).",
           "is_required": false,
           "is_secret": true
+        },
+        {
+          "name": "PROTON_BRIDGE_ATTACHMENT_DIRS",
+          "description": "Folders that proton_send_email and proton_create_draft may attach files from: absolute paths separated by ':'. Unset: every attachment is refused. Anything inside can be mailed out, so name a dedicated folder without secrets.",
+          "is_required": false,
+          "is_secret": false
+        },
+        {
+          "name": "PROTON_BRIDGE_MAX_ATTACHMENT_MB",
+          "description": "Combined attachment size limit per message, in MB.",
+          "default": "18",
+          "is_required": false,
+          "is_secret": false
         }
       ]
     }
